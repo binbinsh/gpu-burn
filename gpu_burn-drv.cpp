@@ -57,6 +57,7 @@
 #include <unistd.h>
 #include <vector>
 #include <regex>
+#include <sstream>
 
 #define SIGTERM_TIMEOUT_THRESHOLD_SECS 30 // number of seconds for sigterm to kill child processes before forcing a sigkill
 
@@ -107,8 +108,8 @@ bool g_running = false;
 
 template <class T> class GPU_Test {
   public:
-    GPU_Test(int dev, bool doubles, bool tensors, const char *kernelFile)
-        : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors), d_kernelFile(kernelFile){
+    GPU_Test(int dev, bool doubles, bool tensors, const char *kernelFile, int nvsmiIndex = -1)
+    : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors), d_kernelFile(kernelFile), d_nvsmiIndex(nvsmiIndex){
         checkError(cuDeviceGet(&d_dev, d_devNumber));
         checkError(cuCtxCreate(&d_ctx, 0, d_dev));
 
@@ -181,7 +182,8 @@ template <class T> class GPU_Test {
 
         printf("Initialized device %d with %lu MB of memory (%lu MB available, "
                "using %lu MB of it), %s%s\n",
-               d_devNumber, totalMemory() / 1024ul / 1024ul,
+               d_nvsmiIndex >= 0 ? d_nvsmiIndex : d_devNumber,
+               totalMemory() / 1024ul / 1024ul,
                availMemory() / 1024ul / 1024ul, useBytes / 1024ul / 1024ul,
                d_doubles ? "using DOUBLES" : "using FLOATS",
                d_tensors ? ", using Tensor Cores" : "");
@@ -273,6 +275,7 @@ template <class T> class GPU_Test {
     bool shouldRun() { return g_running; }
 
   private:
+    int d_nvsmiIndex;   // nvidia-smi index of the GPU
     bool d_doubles;
     bool d_tensors;
     int d_devNumber;
@@ -320,12 +323,98 @@ int initCuda() {
     return deviceCount;
 }
 
+// Get GPU UUID by CUDA device index
+std::string getGpuUuid(int cudaDeviceIndex) {
+    CUdevice device;
+    CUuuid uuid;
+    checkError(cuDeviceGet(&device, cudaDeviceIndex));
+    checkError(cuDeviceGetUuid(&uuid, device));
+    
+    char uuidStr[37]; // UUID string format: 8-4-4-4-12 (32 hex chars + 4 dashes + null terminator)
+    snprintf(uuidStr, sizeof(uuidStr), 
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             (unsigned char)uuid.bytes[0], (unsigned char)uuid.bytes[1], 
+             (unsigned char)uuid.bytes[2], (unsigned char)uuid.bytes[3],
+             (unsigned char)uuid.bytes[4], (unsigned char)uuid.bytes[5],
+             (unsigned char)uuid.bytes[6], (unsigned char)uuid.bytes[7],
+             (unsigned char)uuid.bytes[8], (unsigned char)uuid.bytes[9],
+             (unsigned char)uuid.bytes[10], (unsigned char)uuid.bytes[11],
+             (unsigned char)uuid.bytes[12], (unsigned char)uuid.bytes[13],
+             (unsigned char)uuid.bytes[14], (unsigned char)uuid.bytes[15]);
+    
+    return std::string("GPU-") + uuidStr;
+}
+
+// Create mapping between nvidia-smi device index and CUDA device index
+// Returns a vector where vector[nvidia_smi_index] = cuda_index
+std::vector<int> createNvidiaSmiToCudaMapping(int cudaDeviceCount) {
+    std::vector<int> mapping;
+    
+#if IS_JETSON
+    // On Jetson, we assume the ordering is the same
+    for (int i = 0; i < cudaDeviceCount; i++) {
+        mapping.push_back(i);
+    }
+#else
+    // Get UUIDs from CUDA devices
+    std::vector<std::string> cudaUuids;
+    for (int i = 0; i < cudaDeviceCount; i++) {
+        cudaUuids.push_back(getGpuUuid(i));
+    }
+    
+    // Parse nvidia-smi output to get UUID ordering
+    FILE *fp = popen("nvidia-smi -L", "r");
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to run nvidia-smi -L, assuming same order as CUDA\n");
+        for (int i = 0; i < cudaDeviceCount; i++) {
+            mapping.push_back(i);
+        }
+        return mapping;
+    }
+    
+    char line[512];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        // Parse lines like: "GPU 0: NVIDIA GeForce RTX 4090 (UUID: GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)"
+        char *uuidStart = strstr(line, "UUID: ");
+        if (uuidStart) {
+            uuidStart += 6; // Skip "UUID: "
+            char *uuidEnd = strchr(uuidStart, ')');
+            if (uuidEnd) {
+                *uuidEnd = '\0';
+                std::string nvidiaUuid(uuidStart);
+                
+                // Find matching CUDA device
+                for (int cudaIdx = 0; cudaIdx < cudaDeviceCount; cudaIdx++) {
+                    if (cudaUuids[cudaIdx] == nvidiaUuid) {
+                        mapping.push_back(cudaIdx);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    pclose(fp);
+    
+    // Validate mapping
+    if (mapping.size() != (size_t)cudaDeviceCount) {
+        fprintf(stderr, "Warning: Could not create complete nvidia-smi to CUDA mapping. Using default order.\n");
+        mapping.clear();
+        for (int i = 0; i < cudaDeviceCount; i++) {
+            mapping.push_back(i);
+        }
+    }
+#endif
+    
+    return mapping;
+}
+
 template <class T>
 void startBurn(int index, int writeFd, T *A, T *B, bool doubles, bool tensors,
-               ssize_t useBytes, const char *kernelFile) {
+               ssize_t useBytes, const char *kernelFile, int nvsmiIndex = -1) {
     GPU_Test<T> *our;
     try {
-        our = new GPU_Test<T>(index, doubles, tensors, kernelFile);
+        our = new GPU_Test<T>(index, doubles, tensors, kernelFile, nvsmiIndex);
         our->initBuffers(A, B, useBytes);
     } catch (const std::exception &e) {
         fprintf(stderr, "Couldn't init a GPU test: %s\n", e.what());
@@ -440,8 +529,77 @@ void updateTemps(int handle, std::vector<int> *temps) {
 #endif
 }
 
+void updateTempsWithMapping(int handle, std::vector<int> *temps, const std::vector<int> &nvidiaSmiToCudaMap, int specificCudaDevice = -1) {
+    const int readSize = 10240;
+    static int nvidiaSmiGpuIndex = 0;
+    char data[readSize + 1];
+
+    int curPos = 0;
+    do {
+        read(handle, data + curPos, sizeof(char));
+    } while (data[curPos++] != '\n');
+
+    data[curPos - 1] = 0;
+
+#if IS_JETSON
+    std::string data_str(data);
+    std::regex pattern("GPU@([0-9]+)C");
+    std::smatch matches;
+    if (std::regex_search(data_str, matches, pattern)) {
+        if (matches.size() > 1) {
+            int tempValue = std::stoi(matches[1]);
+            // Map nvidia-smi index to CUDA index
+            if (nvidiaSmiGpuIndex < nvidiaSmiToCudaMap.size()) {
+                int cudaIndex = nvidiaSmiToCudaMap[nvidiaSmiGpuIndex];
+                if (specificCudaDevice >= 0) {
+                    // Single GPU mode: only update if this is our device
+                    if (cudaIndex == specificCudaDevice && temps->size() > 0) {
+                        temps->at(0) = tempValue;
+                    }
+                } else {
+                    // Multi-GPU mode: normal mapping
+                    if (cudaIndex < temps->size()) {
+                        temps->at(cudaIndex) = tempValue;
+                    }
+                }
+            }
+            nvidiaSmiGpuIndex = (nvidiaSmiGpuIndex + 1) % nvidiaSmiToCudaMap.size();
+        }
+    }
+#else
+    // FIXME: The syntax of this print might change in the future..
+    int tempValue;
+    if (sscanf(data,
+               "		GPU Current Temp			: %d C",
+               &tempValue) == 1) {
+        // Map nvidia-smi index to CUDA index
+        if (nvidiaSmiGpuIndex < nvidiaSmiToCudaMap.size()) {
+            int cudaIndex = nvidiaSmiToCudaMap[nvidiaSmiGpuIndex];
+            if (specificCudaDevice >= 0) {
+                // Single GPU mode: only update if this is our device
+                if (cudaIndex == specificCudaDevice && temps->size() > 0) {
+                    temps->at(0) = tempValue;
+                }
+            } else {
+                // Multi-GPU mode: normal mapping
+                if (cudaIndex < temps->size()) {
+                    temps->at(cudaIndex) = tempValue;
+                }
+            }
+        }
+        nvidiaSmiGpuIndex = (nvidiaSmiGpuIndex + 1) % nvidiaSmiToCudaMap.size();
+    } else if (!strcmp(data, "		Gpu				"
+                             "	 : N/A")) {
+        nvidiaSmiGpuIndex = (nvidiaSmiGpuIndex + 1) % nvidiaSmiToCudaMap.size();
+    }
+#endif
+}
+
 void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
-                   int runTime, std::chrono::seconds sigterm_timeout_threshold_secs) {
+                   int runLength,
+                   std::chrono::seconds sigterm_timeout_threshold_secs,
+                   const std::vector<int> &nvidiaSmiToCudaMap,
+                   int specificCudaDevice = -1) {
     fd_set waitHandles;
 
     pid_t tempPid;
@@ -460,34 +618,25 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
     std::vector<int> clientTemp;
     std::vector<int> clientErrors;
     std::vector<int> clientCalcs;
-    std::vector<struct timespec> clientUpdateTime;
-    std::vector<float> clientGflops;
     std::vector<bool> clientFaulty;
 
-    time_t startTime = time(0);
-
-    for (size_t i = 0; i < clientFd.size(); ++i) {
+    for (size_t i = 0; i < clientPid.size(); ++i) {
         clientTemp.push_back(0);
         clientErrors.push_back(0);
         clientCalcs.push_back(0);
-        struct timespec thisTime;
-        clock_gettime(CLOCK_REALTIME, &thisTime);
-        clientUpdateTime.push_back(thisTime);
-        clientGflops.push_back(0.0f);
         clientFaulty.push_back(false);
     }
+
+    time_t startTime = time(0);
 
     int changeCount;
     float nextReport = 10.0f;
     bool childReport = false;
     while (
         (changeCount = select(maxHandle + 1, &waitHandles, NULL, NULL, NULL))) {
-        size_t thisTime = time(0);
-        struct timespec thisTimeSpec;
-        clock_gettime(CLOCK_REALTIME, &thisTimeSpec);
-
-        // Going through all descriptors
-        for (size_t i = 0; i < clientFd.size(); ++i)
+        size_t clientsAlive = 0;
+        time_t currentTime = time(0);
+        for (size_t i = 0; i < clientFd.size(); ++i) {
             if (FD_ISSET(clientFd.at(i), &waitHandles)) {
                 // First, reading processed
                 int processed, errors;
@@ -503,73 +652,102 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                 if (processed == -1)
                     clientCalcs.at(i) = -1;
                 else {
-                    double flops = (double)processed * (double)OPS_PER_MUL;
-                    struct timespec clientPrevTime = clientUpdateTime.at(i);
-                    double clientTimeDelta =
-                        (double)thisTimeSpec.tv_sec +
-                        (double)thisTimeSpec.tv_nsec / 1000000000.0 -
-                        ((double)clientPrevTime.tv_sec +
-                         (double)clientPrevTime.tv_nsec / 1000000000.0);
-                    clientUpdateTime.at(i) = thisTimeSpec;
-
-                    clientGflops.at(i) =
-                        (double)((unsigned long long int)processed *
-                                 OPS_PER_MUL) /
-                        clientTimeDelta / 1000.0 / 1000.0 / 1000.0;
                     clientCalcs.at(i) += processed;
                 }
 
+                if (errors)
+                    clientFaulty.at(i) = true;
+
                 childReport = true;
+                // printf("Got something from %d\n", i);
             }
+            if (clientCalcs.at(i) >= 0)
+                clientsAlive++;
+        }
 
-        if (FD_ISSET(tempHandle, &waitHandles))
-            updateTemps(tempHandle, &clientTemp);
-
-        // Resetting the listeners
-        FD_ZERO(&waitHandles);
-        FD_SET(tempHandle, &waitHandles);
-        for (size_t i = 0; i < clientFd.size(); ++i)
-            FD_SET(clientFd.at(i), &waitHandles);
-
-        // Printing progress (if a child has initted already)
-        if (childReport) {
-            float elapsed =
-                fminf((float)(thisTime - startTime) / (float)runTime * 100.0f,
-                      100.0f);
+        // Updating status
+        float elapsed = fminf((float)(currentTime - startTime) / (float)runLength * 100.0f, 100.0f);
+        if (elapsed >= nextReport || (childReport && nextReport < 100.0f)) {
+            childReport = false;
             printf("\r%.1f%%  ", elapsed);
             printf("proc'd: ");
-            for (size_t i = 0; i < clientCalcs.size(); ++i) {
-                printf("%d (%.0f Gflop/s) ", clientCalcs.at(i),
-                       clientGflops.at(i));
-                if (i != clientCalcs.size() - 1)
-                    printf("- ");
+            if (specificCudaDevice >= 0) {
+                // Single GPU mode: show directly
+                for (size_t i = 0; i < clientCalcs.size(); ++i) {
+                    printf("%d (%.0f Gflop/s)",
+                           clientCalcs.at(i),
+                           (double)clientCalcs.at(i) * (double)OPS_PER_MUL / fmaxf((double)(currentTime - startTime), 0.01) / 1e9);
+                    if (i != clientCalcs.size() - 1)
+                        printf(" - ");
+                }
+            } else {
+                // Multi-GPU mode: show in nvidia-smi order
+                for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
+                    int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
+                    if (cuda_idx < clientCalcs.size()) {
+                        printf("%d (%.0f Gflop/s)",
+                               clientCalcs.at(cuda_idx),
+                               (double)clientCalcs.at(cuda_idx) * (double)OPS_PER_MUL / fmaxf((double)(currentTime - startTime), 0.01) / 1e9);
+                    } else {
+                        printf("-- (-- Gflop/s)");
+                    }
+                    if (nvsmi_idx != nvidiaSmiToCudaMap.size() - 1)
+                        printf(" - ");
+                }
             }
             printf("  errors: ");
-            for (size_t i = 0; i < clientErrors.size(); ++i) {
-                std::string note = "%d ";
-                if (clientCalcs.at(i) == -1)
-                    note += " (DIED!)";
-                else if (clientErrors.at(i))
-                    note += " (WARNING!)";
-
-                printf(note.c_str(), clientErrors.at(i));
-                if (i != clientCalcs.size() - 1)
-                    printf("- ");
+            if (specificCudaDevice >= 0) {
+                // Single GPU mode: show directly
+                for (size_t i = 0; i < clientErrors.size(); ++i) {
+                    printf("%d", clientErrors.at(i));
+                    if (i != clientErrors.size() - 1)
+                        printf(" - ");
+                }
+            } else {
+                // Multi-GPU mode: show in nvidia-smi order
+                for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
+                    int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
+                    if (cuda_idx < clientErrors.size()) {
+                        printf("%d", clientErrors.at(cuda_idx));
+                    } else {
+                        printf("--");
+                    }
+                    if (nvsmi_idx != nvidiaSmiToCudaMap.size() - 1)
+                        printf(" - ");
+                }
             }
             printf("  temps: ");
-            for (size_t i = 0; i < clientTemp.size(); ++i) {
-                printf(clientTemp.at(i) != 0 ? "%d C " : "-- ",
-                       clientTemp.at(i));
-                if (i != clientCalcs.size() - 1)
-                    printf("- ");
+            if (specificCudaDevice >= 0) {
+                // Single GPU mode: show directly
+                for (size_t i = 0; i < clientTemp.size(); ++i) {
+                    printf(clientTemp.at(i) != 0 ? "%d C" : "--",
+                           clientTemp.at(i));
+                    if (i != clientTemp.size() - 1)
+                        printf(" - ");
+                }
+            } else {
+                // Multi-GPU mode: show in nvidia-smi order
+                for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
+                    int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
+                    if (cuda_idx < clientTemp.size()) {
+                        printf(clientTemp.at(cuda_idx) != 0 ? "%d C" : "--",
+                               clientTemp.at(cuda_idx));
+                    } else {
+                        printf("--");
+                    }
+                    if (nvsmi_idx != nvidiaSmiToCudaMap.size() - 1)
+                        printf(" - ");
+                }
             }
-
+            printf("\r");
             fflush(stdout);
 
+            // Mark faulty clients (original logic)
             for (size_t i = 0; i < clientErrors.size(); ++i)
                 if (clientErrors.at(i))
                     clientFaulty.at(i) = true;
 
+            // Print summary every 10% and reset error counters (original format)
             if (nextReport < elapsed) {
                 nextReport = elapsed + 10.0f;
                 printf("\n\tSummary at:   ");
@@ -582,18 +760,23 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
             }
         }
 
-        // Checking whether all clients are dead
-        bool oneAlive = false;
-        for (size_t i = 0; i < clientCalcs.size(); ++i)
-            if (clientCalcs.at(i) != -1)
-                oneAlive = true;
-        if (!oneAlive) {
+        if (currentTime - startTime > runLength)
+            break;
+        if (!clientsAlive) {
             fprintf(stderr, "\n\nNo clients are alive!  Aborting\n");
             exit(ENOMEDIUM);
         }
 
-        if (startTime + runTime < thisTime)
-            break;
+        if (FD_ISSET(tempHandle, &waitHandles))
+            updateTempsWithMapping(tempHandle, &clientTemp, nvidiaSmiToCudaMap, specificCudaDevice);
+
+        // Resetting the listeners
+        FD_ZERO(&waitHandles);
+        FD_SET(tempHandle, &waitHandles);
+        for (size_t i = 0; i < clientFd.size(); ++i) {
+            if (clientCalcs.at(i) >= 0)
+                FD_SET(clientFd.at(i), &waitHandles);
+        }
     }
 
     printf("\nKilling processes with SIGTERM (soft kill)\n");
@@ -647,8 +830,25 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
     printf("done\n");
 
     printf("\nTested %d GPUs:\n", (int)clientPid.size());
-    for (size_t i = 0; i < clientPid.size(); ++i)
-        printf("\tGPU %d: %s\n", (int)i, clientFaulty.at(i) ? "FAULTY" : "OK");
+    if (specificCudaDevice >= 0) {
+        // Single GPU mode: show the specific GPU index from nvidia-smi
+        int nvsmi_index = 0;
+        for (size_t i = 0; i < nvidiaSmiToCudaMap.size(); ++i) {
+            if (nvidiaSmiToCudaMap[i] == specificCudaDevice) {
+                nvsmi_index = i;
+                break;
+            }
+        }
+        printf("\tGPU %d: %s\n", nvsmi_index, clientFaulty.at(0) ? "FAULTY" : "OK");
+    } else {
+        // Multi-GPU mode: show in nvidia-smi order
+        for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
+            int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
+            if (cuda_idx < clientFaulty.size()) {
+                printf("\tGPU %zu: %s\n", nvsmi_idx, clientFaulty.at(cuda_idx) ? "FAULTY" : "OK");
+            }
+        }
+    }
 }
 
 template <class T>
@@ -681,6 +881,9 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
     std::vector<int> clientPipes;
     std::vector<pid_t> clientPids;
     clientPipes.push_back(readMain);
+    
+    // Will be populated by first child process
+    std::vector<int> nvidiaSmiToCudaMap;
 
     if (device_id > -1) {
         pid_t myPid = fork();
@@ -691,8 +894,27 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             initCuda();
             int devCount = 1;
             write(writeFd, &devCount, sizeof(int));
-            startBurn<T>(device_id, writeFd, A, B, useDoubles, useTensorCores,
-                         useBytes, kernelFile);
+            
+            // Create and send mapping
+            int totalDevices = 0;
+            cuDeviceGetCount(&totalDevices);
+            std::vector<int> mapping = createNvidiaSmiToCudaMapping(totalDevices);
+            
+            // Convert nvidia-smi index to CUDA index
+            int cuda_device_id = device_id;
+            if (device_id < mapping.size()) {
+                cuda_device_id = mapping[device_id];
+            } else {
+                fprintf(stderr, "GPU %d not found (nvidia-smi index)\n", device_id);
+                exit(EINVAL);
+            }
+            
+            size_t mapSize = mapping.size();
+            write(writeFd, &mapSize, sizeof(size_t));
+            write(writeFd, mapping.data(), mapSize * sizeof(int));
+            
+            startBurn<T>(cuda_device_id, writeFd, A, B, useDoubles, useTensorCores,
+                         useBytes, kernelFile, device_id);
             close(writeFd);
             return;
         } else {
@@ -700,64 +922,133 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             close(mainPipe[1]);
             int devCount;
             read(readMain, &devCount, sizeof(int));
-            listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
+            
+            // Read mapping
+            size_t mapSize;
+            read(readMain, &mapSize, sizeof(size_t));
+            nvidiaSmiToCudaMap.resize(mapSize);
+            read(readMain, nvidiaSmiToCudaMap.data(), mapSize * sizeof(int));
+            
+            // Convert nvidia-smi index to CUDA index for temperature monitoring
+            int cuda_device_id = device_id < nvidiaSmiToCudaMap.size() ? nvidiaSmiToCudaMap[device_id] : device_id;
+            
+            listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs, nvidiaSmiToCudaMap, cuda_device_id);
         }
         for (size_t i = 0; i < clientPipes.size(); ++i)
             close(clientPipes.at(i));
     } else {
         pid_t myPid = fork();
         if (!myPid) {
-            // Child
+            // Child - 第一个GPU
             close(mainPipe[0]);
             int writeFd = mainPipe[1];
             int devCount = initCuda();
             write(writeFd, &devCount, sizeof(int));
 
-            startBurn<T>(0, writeFd, A, B, useDoubles, useTensorCores,
-                         useBytes, kernelFile);
+            // 创建映射并找到CUDA设备0对应的nvidia-smi索引
+            std::vector<int> mapping = createNvidiaSmiToCudaMapping(devCount);
+            int nvsmiIndex = 0;
+            for (int i = 0; i < mapping.size(); i++) {
+                if (mapping[i] == 0) {
+                    nvsmiIndex = i;
+                    break;
+                }
+            }
 
+            startBurn<T>(0, writeFd, A, B, useDoubles, useTensorCores, useBytes,
+                         kernelFile, nvsmiIndex);
             close(writeFd);
             return;
         } else {
             clientPids.push_back(myPid);
-
             close(mainPipe[1]);
             int devCount;
             read(readMain, &devCount, sizeof(int));
-
             if (!devCount) {
-                fprintf(stderr, "No CUDA devices\n");
+                fprintf(stderr, "No CUDA devices\\n");
                 exit(ENODEV);
             } else {
+                // First process creates the mapping
+                int mappingPipe[2];
+                pipe(mappingPipe);
+
+                pid_t mappingPid = fork();
+                if (!mappingPid) {
+                    // Child to create mapping
+                    close(mappingPipe[0]);
+                    initCuda();
+                    std::vector<int> mapping =
+                        createNvidiaSmiToCudaMapping(devCount);
+                    size_t mapSize = mapping.size();
+                    write(mappingPipe[1], &mapSize, sizeof(size_t));
+                    write(mappingPipe[1], mapping.data(),
+                          mapSize * sizeof(int));
+                    close(mappingPipe[1]);
+                    exit(0);
+                }
+
+                // Parent reads mapping
+                close(mappingPipe[1]);
+                size_t mapSize;
+                read(mappingPipe[0], &mapSize, sizeof(size_t));
+                nvidiaSmiToCudaMap.resize(mapSize);
+                read(mappingPipe[0], nvidiaSmiToCudaMap.data(),
+                     mapSize * sizeof(int));
+                close(mappingPipe[0]);
+                waitpid(mappingPid, NULL, 0);
+
+                // 为其他GPU创建子进程
                 for (int i = 1; i < devCount; ++i) {
                     int slavePipe[2];
                     pipe(slavePipe);
+
+                    // 创建一个管道来传递nvidia-smi索引
+                    int indexPipe[2];
+                    pipe(indexPipe);
+
                     clientPipes.push_back(slavePipe[0]);
-
                     pid_t slavePid = fork();
-
                     if (!slavePid) {
                         // Child
                         close(slavePipe[0]);
+                        close(indexPipe[1]);
+
+                        // 读取nvidia-smi索引
+                        int nvsmiIndex;
+                        read(indexPipe[0], &nvsmiIndex, sizeof(int));
+                        close(indexPipe[0]);
+
                         initCuda();
                         startBurn<T>(i, slavePipe[1], A, B, useDoubles,
-                                     useTensorCores, useBytes, kernelFile);
-
+                                     useTensorCores, useBytes, kernelFile,
+                                     nvsmiIndex);
                         close(slavePipe[1]);
                         return;
                     } else {
                         clientPids.push_back(slavePid);
                         close(slavePipe[1]);
+                        close(indexPipe[0]);
+
+                        // 找到CUDA设备i对应的nvidia-smi索引并发送给子进程
+                        int nvsmiIndex = 0;
+                        for (int j = 0; j < nvidiaSmiToCudaMap.size(); j++) {
+                            if (nvidiaSmiToCudaMap[j] == i) {
+                                nvsmiIndex = j;
+                                break;
+                            }
+                        }
+                        write(indexPipe[1], &nvsmiIndex, sizeof(int));
+                        close(indexPipe[1]);
                     }
                 }
-
-                listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs);
+                listenClients(clientPipes, clientPids, runLength,
+                              sigterm_timeout_threshold_secs,
+                              nvidiaSmiToCudaMap);
             }
         }
         for (size_t i = 0; i < clientPipes.size(); ++i)
             close(clientPipes.at(i));
     }
-
     free(A);
     free(B);
 }
@@ -770,8 +1061,8 @@ void showHelp() {
            (int)(USEMEM * 100));
     printf("-d\tUse doubles\n");
     printf("-tc\tTry to use Tensor cores\n");
-    printf("-l\tLists all GPUs in the system\n");
-    printf("-i N\tExecute only on GPU N\n");
+    printf("-l\tLists all GPUs in the system (in nvidia-smi order)\n");
+    printf("-i N\tExecute only on GPU N (N is the GPU index from nvidia-smi)\n");
     printf("-c FILE\tUse FILE as compare kernel.  Default is %s\n",
            COMPARE_KERNEL);
     printf("-stts T\tSet timeout threshold to T seconds for using SIGTERM to abort child processes before using SIGKILL.  Default is %d\n",
@@ -781,8 +1072,8 @@ void showHelp() {
     printf("  gpu-burn -d 3600 # burns all GPUs with doubles for an hour\n");
     printf(
         "  gpu-burn -m 50%% # burns using 50%% of the available GPU memory\n");
-    printf("  gpu-burn -l # list GPUs\n");
-    printf("  gpu-burn -i 2 # burns only GPU of index 2\n");
+    printf("  gpu-burn -l # list GPUs (in nvidia-smi order)\n");
+    printf("  gpu-burn -i 0 # burns only GPU 0 (nvidia-smi index)\n");
 }
 
 // NNN MB
@@ -819,16 +1110,21 @@ int main(int argc, char **argv) {
             if (count == 0) {
                 throw std::runtime_error("No CUDA capable GPUs found.\n");
             }
-            for (int i_dev = 0; i_dev < count; i_dev++) {
-                CUdevice device_l;
+            
+            // Create mapping from nvidia-smi to CUDA indices
+            std::vector<int> nvidiaSmiToCudaMap = createNvidiaSmiToCudaMapping(count);
+            
+            // Display GPUs in nvidia-smi order
+            for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); nvsmi_idx++) {
+                int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
+                CUdevice device;
                 char device_name[255];
-                checkError(cuDeviceGet(&device_l, i_dev));
-                checkError(cuDeviceGetName(device_name, 255, device_l));
-                size_t device_mem_l;
-                checkError(cuDeviceTotalMem(&device_mem_l, device_l));
-                printf("ID %i: %s, %ldMB\n", i_dev, device_name,
-                       device_mem_l / 1000 / 1000);
+                checkError(cuDeviceGet(&device, cuda_idx));
+                checkError(cuDeviceGetName(device_name, 255, device));
+                std::string uuid = getGpuUuid(cuda_idx);
+                printf("GPU %zu: %s (UUID: %s)\n", nvsmi_idx, device_name, uuid.c_str());
             }
+            
             thisParam++;
             return 0;
         }
