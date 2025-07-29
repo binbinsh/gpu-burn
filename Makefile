@@ -26,13 +26,13 @@ override LDFLAGS  += -Wl,-rpath=${CUDAPATH}/lib
 override LDFLAGS  += -lcublas
 override LDFLAGS  += -lcudart
 
-COMPUTE      ?= 50
+COMPUTE      ?= 89
 CUDA_VERSION ?= 11.8.0
 IMAGE_DISTRO ?= ubi8
 
 override NVCCFLAGS ?=
 override NVCCFLAGS += -I${CUDAPATH}/include
-override NVCCFLAGS += -arch=compute_$(subst .,,${COMPUTE})
+override NVCCFLAGS += -arch=sm_$(subst .,,${COMPUTE})
 
 IMAGE_NAME ?= gpu-burn
 

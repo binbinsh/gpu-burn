@@ -8,7 +8,7 @@
  * 1. Redistributions of source code must retain the above copyright notice,
  *this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright notice,
- *	this list of conditions and the following disclaimer in the
+ * this list of conditions and the following disclaimer in the
  *documentation and/or other materials provided with the distribution.
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
@@ -64,6 +64,7 @@
 #include "cublas_v2.h"
 #define CUDA_ENABLE_DEPRECATED
 #include <cuda.h>
+#include <cuda_bf16.h> // BF16 CHANGE: Include bfloat16 header
 
 void _checkError(int rCode, std::string file, int line, std::string desc = "") {
     if (rCode != CUDA_SUCCESS) {
@@ -82,9 +83,9 @@ void _checkError(int rCode, std::string file, int line, std::string desc = "") {
 void _checkError(cublasStatus_t rCode, std::string file, int line, std::string desc = "") {
     if (rCode != CUBLAS_STATUS_SUCCESS) {
 #if CUBLAS_VER_MAJOR >= 12
-		const char *err = cublasGetStatusString(rCode);
+        const char *err = cublasGetStatusString(rCode);
 #else
-		const char *err = "";
+        const char *err = "";
 #endif
         throw std::runtime_error(
             (desc == "" ? std::string("Error (")
@@ -108,14 +109,14 @@ bool g_running = false;
 
 template <class T> class GPU_Test {
   public:
-    GPU_Test(int dev, bool doubles, bool tensors, const char *kernelFile, int nvsmiIndex = -1)
-    : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors), d_kernelFile(kernelFile), d_nvsmiIndex(nvsmiIndex){
+    // BF16 CHANGE: Add bf16 flag to constructor
+    GPU_Test(int dev, bool doubles, bool tensors, bool bf16, const char *kernelFile, int nvsmiIndex = -1)
+    : d_devNumber(dev), d_doubles(doubles), d_tensors(tensors), d_bf16(bf16), d_kernelFile(kernelFile), d_nvsmiIndex(nvsmiIndex){
         checkError(cuDeviceGet(&d_dev, d_devNumber));
         checkError(cuCtxCreate(&d_ctx, 0, d_dev));
 
         bind();
 
-        // checkError(cublasInit());
         checkError(cublasCreate(&d_cublas), "init");
 
         if (d_tensors)
@@ -179,15 +180,16 @@ template <class T> class GPU_Test {
             useBytes = (ssize_t)((double)availMemory() * USEMEM);
         if (useBytes < 0)
             useBytes = (ssize_t)((double)availMemory() * (-useBytes / 100.0));
-
+        
+        // BF16 CHANGE: Update status message to show bfloat16 type
         printf("Initialized device %d with %lu MB of memory (%lu MB available, "
                "using %lu MB of it), %s%s\n",
                d_nvsmiIndex >= 0 ? d_nvsmiIndex : d_devNumber,
                totalMemory() / 1024ul / 1024ul,
                availMemory() / 1024ul / 1024ul, useBytes / 1024ul / 1024ul,
-               d_doubles ? "using DOUBLES" : "using FLOATS",
+               d_doubles ? "using DOUBLES" : (d_bf16 ? "using BFLOAT16" : "using FLOATS"),
                d_tensors ? ", using Tensor Cores" : "");
-        size_t d_resultSize = sizeof(T) * SIZE * SIZE;
+        d_resultSize = sizeof(T) * SIZE * SIZE;
         d_iters = (useBytes - 2 * d_resultSize) /
                   d_resultSize; // We remove A and B sizes
         printf("Results are %zu bytes each, thus performing %zu iterations\n",
@@ -222,6 +224,17 @@ template <class T> class GPU_Test {
                                 (const double *)d_Bdata, SIZE, &betaD,
                                 (double *)d_Cdata + i * SIZE * SIZE, SIZE),
                     "DGEMM");
+            // BF16 CHANGE: Add logic for bfloat16 GEMM using cublasGemmEx
+            else if (d_bf16) {
+                cublasGemmAlgo_t algo = d_tensors ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
+                checkError(
+                    cublasGemmEx(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE, SIZE,
+                                SIZE, &alpha, (const void*)d_Adata, CUDA_R_16BF, SIZE,
+                                (const void*)d_Bdata, CUDA_R_16BF, SIZE, &beta,
+                                (__nv_bfloat16 *)d_Cdata + i * SIZE * SIZE, CUDA_R_16BF, SIZE,
+                                CUDA_R_32F, algo),
+                    "HGEMM (BF16)");
+            }
             else
                 checkError(
                     cublasSgemm(d_cublas, CUBLAS_OP_N, CUBLAS_OP_N, SIZE, SIZE,
@@ -239,9 +252,17 @@ template <class T> class GPU_Test {
                        std::string("couldn't find compare kernel: ") + d_kernelFile);
         }
         checkError(cuModuleLoad(&d_module, d_kernelFile), "load module");
-        checkError(cuModuleGetFunction(&d_function, d_module,
-                                       d_doubles ? "compareD" : "compare"),
-                   "get func");
+        
+        // BF16 CHANGE: Select the correct kernel name based on the data type
+        const char* kernel_name;
+        if (d_doubles) {
+            kernel_name = "compareD";
+        } else if (d_bf16) {
+            kernel_name = "compareBf16";
+        } else {
+            kernel_name = "compare";
+        }
+        checkError(cuModuleGetFunction(&d_function, d_module, kernel_name), "get func");
 
         checkError(cuFuncSetCacheConfig(d_function, CU_FUNC_CACHE_PREFER_L1),
                    "L1 config");
@@ -278,6 +299,7 @@ template <class T> class GPU_Test {
     int d_nvsmiIndex;   // nvidia-smi index of the GPU
     bool d_doubles;
     bool d_tensors;
+    bool d_bf16; // BF16 CHANGE: Add flag for bfloat16
     int d_devNumber;
     const char *d_kernelFile;
     size_t d_iters;
@@ -303,12 +325,12 @@ template <class T> class GPU_Test {
 
 // Returns the number of devices
 int initCuda() {
-	try {
-		checkError(cuInit(0));
-	} catch (std::runtime_error e) {
-		fprintf(stderr, "Couldn't init CUDA: %s\n", e.what());
-		return 0;
-	}
+    try {
+        checkError(cuInit(0));
+    } catch (std::runtime_error e) {
+        fprintf(stderr, "Couldn't init CUDA: %s\n", e.what());
+        return 0;
+    }
     int deviceCount = 0;
     checkError(cuDeviceGetCount(&deviceCount));
 
@@ -409,12 +431,14 @@ std::vector<int> createNvidiaSmiToCudaMapping(int cudaDeviceCount) {
     return mapping;
 }
 
+// BF16 CHANGE: Add bf16 flag to startBurn function
 template <class T>
-void startBurn(int index, int writeFd, T *A, T *B, bool doubles, bool tensors,
+void startBurn(int index, int writeFd, T *A, T *B, bool doubles, bool tensors, bool bf16,
                ssize_t useBytes, const char *kernelFile, int nvsmiIndex = -1) {
     GPU_Test<T> *our;
     try {
-        our = new GPU_Test<T>(index, doubles, tensors, kernelFile, nvsmiIndex);
+        // BF16 CHANGE: Pass bf16 flag to GPU_Test constructor
+        our = new GPU_Test<T>(index, doubles, tensors, bf16, kernelFile, nvsmiIndex);
         our->initBuffers(A, B, useBytes);
     } catch (const std::exception &e) {
         fprintf(stderr, "Couldn't init a GPU test: %s\n", e.what());
@@ -517,12 +541,12 @@ void updateTemps(int handle, std::vector<int> *temps) {
     // FIXME: The syntax of this print might change in the future..
     int tempValue;
     if (sscanf(data,
-               "		GPU Current Temp			: %d C",
+               "        GPU Current Temp            : %d C",
                &tempValue) == 1) {
         temps->at(gpuIter) = tempValue;
         gpuIter = (gpuIter + 1) % (temps->size());
-    } else if (!strcmp(data, "		Gpu				"
-                             "	 : N/A"))
+    } else if (!strcmp(data, "      Gpu             "
+                             "   : N/A"))
         gpuIter =
             (gpuIter + 1) %
             (temps->size()); // We rotate the iterator for N/A values as well
@@ -570,7 +594,7 @@ void updateTempsWithMapping(int handle, std::vector<int> *temps, const std::vect
     // FIXME: The syntax of this print might change in the future..
     int tempValue;
     if (sscanf(data,
-               "		GPU Current Temp			: %d C",
+               "        GPU Current Temp            : %d C",
                &tempValue) == 1) {
         // Map nvidia-smi index to CUDA index
         if (nvidiaSmiGpuIndex < nvidiaSmiToCudaMap.size()) {
@@ -588,8 +612,8 @@ void updateTempsWithMapping(int handle, std::vector<int> *temps, const std::vect
             }
         }
         nvidiaSmiGpuIndex = (nvidiaSmiGpuIndex + 1) % nvidiaSmiToCudaMap.size();
-    } else if (!strcmp(data, "		Gpu				"
-                             "	 : N/A")) {
+    } else if (!strcmp(data, "      Gpu             "
+                             "   : N/A")) {
         nvidiaSmiGpuIndex = (nvidiaSmiGpuIndex + 1) % nvidiaSmiToCudaMap.size();
     }
 #endif
@@ -659,14 +683,15 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                     clientFaulty.at(i) = true;
 
                 childReport = true;
-                // printf("Got something from %d\n", i);
             }
             if (clientCalcs.at(i) >= 0)
                 clientsAlive++;
         }
 
         // Updating status
-        float elapsed = fminf((float)(currentTime - startTime) / (float)runLength * 100.0f, 100.0f);
+        float elapsed =
+            fminf((float)(currentTime - startTime) / (float)runLength * 100.0f,
+                  100.0f);
         if (elapsed >= nextReport || (childReport && nextReport < 100.0f)) {
             childReport = false;
             printf("\r%.1f%%  ", elapsed);
@@ -674,20 +699,25 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
             if (specificCudaDevice >= 0) {
                 // Single GPU mode: show directly
                 for (size_t i = 0; i < clientCalcs.size(); ++i) {
-                    printf("%d (%.0f Gflop/s)",
-                           clientCalcs.at(i),
-                           (double)clientCalcs.at(i) * (double)OPS_PER_MUL / fmaxf((double)(currentTime - startTime), 0.01) / 1e9);
+                    printf("%d (%.0f Gflop/s)", clientCalcs.at(i),
+                           (double)clientCalcs.at(i) * (double)OPS_PER_MUL /
+                               fmaxf((double)(currentTime - startTime), 0.01) /
+                               1e9);
                     if (i != clientCalcs.size() - 1)
                         printf(" - ");
                 }
             } else {
                 // Multi-GPU mode: show in nvidia-smi order
-                for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
+                for (size_t nvsmi_idx = 0;
+                     nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
                     int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
                     if (cuda_idx < clientCalcs.size()) {
-                        printf("%d (%.0f Gflop/s)",
-                               clientCalcs.at(cuda_idx),
-                               (double)clientCalcs.at(cuda_idx) * (double)OPS_PER_MUL / fmaxf((double)(currentTime - startTime), 0.01) / 1e9);
+                        printf(
+                            "%d (%.0f Gflop/s)", clientCalcs.at(cuda_idx),
+                            (double)clientCalcs.at(cuda_idx) *
+                                (double)OPS_PER_MUL /
+                                fmaxf((double)(currentTime - startTime), 0.01) /
+                                1e9);
                     } else {
                         printf("-- (-- Gflop/s)");
                     }
@@ -705,7 +735,8 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                 }
             } else {
                 // Multi-GPU mode: show in nvidia-smi order
-                for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
+                for (size_t nvsmi_idx = 0;
+                     nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
                     int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
                     if (cuda_idx < clientErrors.size()) {
                         printf("%d", clientErrors.at(cuda_idx));
@@ -720,18 +751,27 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
             if (specificCudaDevice >= 0) {
                 // Single GPU mode: show directly
                 for (size_t i = 0; i < clientTemp.size(); ++i) {
-                    printf(clientTemp.at(i) != 0 ? "%d C" : "--",
-                           clientTemp.at(i));
+                    // FIX #1: Corrected printing logic
+                    if (clientTemp.at(i) != 0) {
+                        printf("%d C", clientTemp.at(i));
+                    } else {
+                        printf("--");
+                    }
                     if (i != clientTemp.size() - 1)
                         printf(" - ");
                 }
             } else {
                 // Multi-GPU mode: show in nvidia-smi order
-                for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
+                for (size_t nvsmi_idx = 0;
+                     nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
                     int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
                     if (cuda_idx < clientTemp.size()) {
-                        printf(clientTemp.at(cuda_idx) != 0 ? "%d C" : "--",
-                               clientTemp.at(cuda_idx));
+                        // FIX #2: Corrected printing logic here as well
+                        if (clientTemp.at(cuda_idx) != 0) {
+                            printf("%d C", clientTemp.at(cuda_idx));
+                        } else {
+                            printf("--");
+                        }
                     } else {
                         printf("--");
                     }
@@ -742,17 +782,15 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
             printf("\r");
             fflush(stdout);
 
-            // Mark faulty clients (original logic)
             for (size_t i = 0; i < clientErrors.size(); ++i)
                 if (clientErrors.at(i))
                     clientFaulty.at(i) = true;
 
-            // Print summary every 10% and reset error counters (original format)
             if (nextReport < elapsed) {
                 nextReport = elapsed + 10.0f;
                 printf("\n\tSummary at:   ");
                 fflush(stdout);
-                system("date"); // Printing a date
+                system("date");
                 fflush(stdout);
                 printf("\n");
                 for (size_t i = 0; i < clientErrors.size(); ++i)
@@ -768,9 +806,9 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
         }
 
         if (FD_ISSET(tempHandle, &waitHandles))
-            updateTempsWithMapping(tempHandle, &clientTemp, nvidiaSmiToCudaMap, specificCudaDevice);
+            updateTempsWithMapping(tempHandle, &clientTemp, nvidiaSmiToCudaMap,
+                                   specificCudaDevice);
 
-        // Resetting the listeners
         FD_ZERO(&waitHandles);
         FD_SET(tempHandle, &waitHandles);
         for (size_t i = 0; i < clientFd.size(); ++i) {
@@ -786,40 +824,33 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
 
     kill(tempPid, SIGTERM);
 
-    // processes should be terminated by SIGTERM within threshold time (so wait and then check pids)
     std::this_thread::sleep_for(sigterm_timeout_threshold_secs);
 
-    // check each process and see if they are alive
-    std::vector<int> killed_processes; // track the number of killed processes
-    // loop through pids for each client / GPU
+    std::vector<int> killed_processes;
     for (size_t i = 0; i < clientPid.size(); ++i) {
         int status;
         pid_t return_pid = waitpid(clientPid.at(i), &status, WNOHANG);
         if (return_pid == clientPid.at(i)) {
-            /* child is finished. exit status in status */
             killed_processes.push_back(return_pid);
         }
     }
-    // handle the tempPid
     int status;
     pid_t return_pid = waitpid(tempPid, &status, WNOHANG);
     if (return_pid == tempPid) {
-        /* child is finished. exit status in status */
         killed_processes.push_back(return_pid);
     }
 
-    // number of killed process should be number GPUs + 1 (need to add tempPid process) to exit while loop early
     if (killed_processes.size() != clientPid.size() + 1) {
         printf("\nKilling processes with SIGKILL (force kill)\n");
 
         for (size_t i = 0; i < clientPid.size(); ++i) {
-            // check if pid was already killed with SIGTERM before using SIGKILL
-            if (std::find(killed_processes.begin(), killed_processes.end(), clientPid.at(i)) == killed_processes.end())
+            if (std::find(killed_processes.begin(), killed_processes.end(),
+                          clientPid.at(i)) == killed_processes.end())
                 kill(clientPid.at(i), SIGKILL);
         }
 
-        // check if pid was already killed with SIGTERM before using SIGKILL
-        if (std::find(killed_processes.begin(), killed_processes.end(), tempPid) == killed_processes.end())
+        if (std::find(killed_processes.begin(), killed_processes.end(),
+                      tempPid) == killed_processes.end())
             kill(tempPid, SIGKILL);
     }
 
@@ -831,7 +862,6 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
 
     printf("\nTested %d GPUs:\n", (int)clientPid.size());
     if (specificCudaDevice >= 0) {
-        // Single GPU mode: show the specific GPU index from nvidia-smi
         int nvsmi_index = 0;
         for (size_t i = 0; i < nvidiaSmiToCudaMap.size(); ++i) {
             if (nvidiaSmiToCudaMap[i] == specificCudaDevice) {
@@ -839,20 +869,23 @@ void listenClients(std::vector<int> clientFd, std::vector<pid_t> clientPid,
                 break;
             }
         }
-        printf("\tGPU %d: %s\n", nvsmi_index, clientFaulty.at(0) ? "FAULTY" : "OK");
+        printf("\tGPU %d: %s\n", nvsmi_index,
+               clientFaulty.at(0) ? "FAULTY" : "OK");
     } else {
-        // Multi-GPU mode: show in nvidia-smi order
-        for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); ++nvsmi_idx) {
+        for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size();
+             ++nvsmi_idx) {
             int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
             if (cuda_idx < clientFaulty.size()) {
-                printf("\tGPU %zu: %s\n", nvsmi_idx, clientFaulty.at(cuda_idx) ? "FAULTY" : "OK");
+                printf("\tGPU %zu: %s\n", nvsmi_idx,
+                       clientFaulty.at(cuda_idx) ? "FAULTY" : "OK");
             }
         }
     }
 }
 
+// BF16 CHANGE: Add useBf16 flag to launch function
 template <class T>
-void launch(int runLength, bool useDoubles, bool useTensorCores,
+void launch(int runLength, bool useDoubles, bool useTensorCores, bool useBf16,
             ssize_t useBytes, int device_id, const char * kernelFile,
             std::chrono::seconds sigterm_timeout_threshold_secs) {
 #if IS_JETSON
@@ -864,17 +897,15 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
     system("nvidia-smi -L");
 #endif
 
-    // Initting A and B with random data
     T *A = (T *)malloc(sizeof(T) * SIZE * SIZE);
     T *B = (T *)malloc(sizeof(T) * SIZE * SIZE);
     srand(10);
     for (size_t i = 0; i < SIZE * SIZE; ++i) {
-        A[i] = (T)((double)(rand() % 1000000) / 100000.0);
-        B[i] = (T)((double)(rand() % 1000000) / 100000.0);
+        // This cast sequence works for float, double, and __nv_bfloat16
+        A[i] = (T)(float)((double)(rand() % 1000000) / 100000.0);
+        B[i] = (T)(float)((double)(rand() % 1000000) / 100000.0);
     }
 
-    // Forking a process..  This one checks the number of devices to use,
-    // returns the value, and continues to use the first one.
     int mainPipe[2];
     pipe(mainPipe);
     int readMain = mainPipe[0];
@@ -882,25 +913,21 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
     std::vector<pid_t> clientPids;
     clientPipes.push_back(readMain);
     
-    // Will be populated by first child process
     std::vector<int> nvidiaSmiToCudaMap;
 
     if (device_id > -1) {
         pid_t myPid = fork();
         if (!myPid) {
-            // Child
             close(mainPipe[0]);
             int writeFd = mainPipe[1];
             initCuda();
             int devCount = 1;
             write(writeFd, &devCount, sizeof(int));
             
-            // Create and send mapping
             int totalDevices = 0;
             cuDeviceGetCount(&totalDevices);
             std::vector<int> mapping = createNvidiaSmiToCudaMapping(totalDevices);
             
-            // Convert nvidia-smi index to CUDA index
             int cuda_device_id = device_id;
             if (device_id < mapping.size()) {
                 cuda_device_id = mapping[device_id];
@@ -913,7 +940,8 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             write(writeFd, &mapSize, sizeof(size_t));
             write(writeFd, mapping.data(), mapSize * sizeof(int));
             
-            startBurn<T>(cuda_device_id, writeFd, A, B, useDoubles, useTensorCores,
+            // BF16 CHANGE: Pass useBf16 flag to startBurn
+            startBurn<T>(cuda_device_id, writeFd, A, B, useDoubles, useTensorCores, useBf16,
                          useBytes, kernelFile, device_id);
             close(writeFd);
             return;
@@ -923,13 +951,11 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
             int devCount;
             read(readMain, &devCount, sizeof(int));
             
-            // Read mapping
             size_t mapSize;
             read(readMain, &mapSize, sizeof(size_t));
             nvidiaSmiToCudaMap.resize(mapSize);
             read(readMain, nvidiaSmiToCudaMap.data(), mapSize * sizeof(int));
             
-            // Convert nvidia-smi index to CUDA index for temperature monitoring
             int cuda_device_id = device_id < nvidiaSmiToCudaMap.size() ? nvidiaSmiToCudaMap[device_id] : device_id;
             
             listenClients(clientPipes, clientPids, runLength, sigterm_timeout_threshold_secs, nvidiaSmiToCudaMap, cuda_device_id);
@@ -939,23 +965,21 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
     } else {
         pid_t myPid = fork();
         if (!myPid) {
-            // Child - 第一个GPU
             close(mainPipe[0]);
             int writeFd = mainPipe[1];
             int devCount = initCuda();
             write(writeFd, &devCount, sizeof(int));
 
-            // 创建映射并找到CUDA设备0对应的nvidia-smi索引
             std::vector<int> mapping = createNvidiaSmiToCudaMapping(devCount);
             int nvsmiIndex = 0;
-            for (int i = 0; i < mapping.size(); i++) {
+            for (size_t i = 0; i < mapping.size(); i++) {
                 if (mapping[i] == 0) {
                     nvsmiIndex = i;
                     break;
                 }
             }
-
-            startBurn<T>(0, writeFd, A, B, useDoubles, useTensorCores, useBytes,
+            // BF16 CHANGE: Pass useBf16 flag to startBurn
+            startBurn<T>(0, writeFd, A, B, useDoubles, useTensorCores, useBf16, useBytes,
                          kernelFile, nvsmiIndex);
             close(writeFd);
             return;
@@ -968,13 +992,11 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
                 fprintf(stderr, "No CUDA devices\\n");
                 exit(ENODEV);
             } else {
-                // First process creates the mapping
                 int mappingPipe[2];
                 pipe(mappingPipe);
 
                 pid_t mappingPid = fork();
                 if (!mappingPid) {
-                    // Child to create mapping
                     close(mappingPipe[0]);
                     initCuda();
                     std::vector<int> mapping =
@@ -987,7 +1009,6 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
                     exit(0);
                 }
 
-                // Parent reads mapping
                 close(mappingPipe[1]);
                 size_t mapSize;
                 read(mappingPipe[0], &mapSize, sizeof(size_t));
@@ -997,30 +1018,27 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
                 close(mappingPipe[0]);
                 waitpid(mappingPid, NULL, 0);
 
-                // 为其他GPU创建子进程
                 for (int i = 1; i < devCount; ++i) {
                     int slavePipe[2];
                     pipe(slavePipe);
 
-                    // 创建一个管道来传递nvidia-smi索引
                     int indexPipe[2];
                     pipe(indexPipe);
 
                     clientPipes.push_back(slavePipe[0]);
                     pid_t slavePid = fork();
                     if (!slavePid) {
-                        // Child
                         close(slavePipe[0]);
                         close(indexPipe[1]);
 
-                        // 读取nvidia-smi索引
                         int nvsmiIndex;
                         read(indexPipe[0], &nvsmiIndex, sizeof(int));
                         close(indexPipe[0]);
 
                         initCuda();
+                        // BF16 CHANGE: Pass useBf16 flag to startBurn
                         startBurn<T>(i, slavePipe[1], A, B, useDoubles,
-                                     useTensorCores, useBytes, kernelFile,
+                                     useTensorCores, useBf16, useBytes, kernelFile,
                                      nvsmiIndex);
                         close(slavePipe[1]);
                         return;
@@ -1029,9 +1047,8 @@ void launch(int runLength, bool useDoubles, bool useTensorCores,
                         close(slavePipe[1]);
                         close(indexPipe[0]);
 
-                        // 找到CUDA设备i对应的nvidia-smi索引并发送给子进程
                         int nvsmiIndex = 0;
-                        for (int j = 0; j < nvidiaSmiToCudaMap.size(); j++) {
+                        for (size_t j = 0; j < nvidiaSmiToCudaMap.size(); j++) {
                             if (nvidiaSmiToCudaMap[j] == i) {
                                 nvsmiIndex = j;
                                 break;
@@ -1060,6 +1077,7 @@ void showHelp() {
     printf("-m N%%\tUse N%% of the available GPU memory.  Default is %d%%\n",
            (int)(USEMEM * 100));
     printf("-d\tUse doubles\n");
+    printf("-bf16\tUse bfloat16\n"); // BF16 CHANGE: Add help text for new option
     printf("-tc\tTry to use Tensor cores\n");
     printf("-l\tLists all GPUs in the system (in nvidia-smi order)\n");
     printf("-i N\tExecute only on GPU N (N is the GPU index from nvidia-smi)\n");
@@ -1076,9 +1094,6 @@ void showHelp() {
     printf("  gpu-burn -i 0 # burns only GPU 0 (nvidia-smi index)\n");
 }
 
-// NNN MB
-// NN% <0
-// 0 --- error
 ssize_t decodeUSEMEM(const char *s) {
     char *s2;
     int64_t r = strtoll(s, &s2, 10);
@@ -1093,8 +1108,9 @@ int main(int argc, char **argv) {
     int runLength = 10;
     bool useDoubles = false;
     bool useTensorCores = false;
+    bool useBf16 = false; // BF16 CHANGE: Add flag for bfloat16 mode
     int thisParam = 0;
-    ssize_t useBytes = 0; // 0 == use USEMEM% of free mem
+    ssize_t useBytes = 0;
     int device_id = -1;
     char *kernelFile = (char *)COMPARE_KERNEL;
     std::chrono::seconds sigterm_timeout_threshold_secs = std::chrono::seconds(SIGTERM_TIMEOUT_THRESHOLD_SECS);
@@ -1111,10 +1127,8 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("No CUDA capable GPUs found.\n");
             }
             
-            // Create mapping from nvidia-smi to CUDA indices
             std::vector<int> nvidiaSmiToCudaMap = createNvidiaSmiToCudaMapping(count);
             
-            // Display GPUs in nvidia-smi order
             for (size_t nvsmi_idx = 0; nvsmi_idx < nvidiaSmiToCudaMap.size(); nvsmi_idx++) {
                 int cuda_idx = nvidiaSmiToCudaMap[nvsmi_idx];
                 CUdevice device;
@@ -1132,6 +1146,11 @@ int main(int argc, char **argv) {
             useDoubles = true;
             thisParam++;
         }
+        // BF16 CHANGE: Add command line parsing for -bf16
+        if (argc >= 2 && std::string(argv[i]).find("-bf16") != std::string::npos) {
+            useBf16 = true;
+            thisParam++;
+        }
         if (argc >= 2 &&
             std::string(argv[i]).find("-tc") != std::string::npos) {
             useTensorCores = true;
@@ -1140,8 +1159,6 @@ int main(int argc, char **argv) {
         if (argc >= 2 && strncmp(argv[i], "-m", 2) == 0) {
             thisParam++;
 
-            // -mNNN[%]
-            // -m NNN[%]
             if (argv[i][2]) {
                 useBytes = decodeUSEMEM(argv[i] + 2);
             } else if (i + 1 < args.size()) {
@@ -1189,6 +1206,12 @@ int main(int argc, char **argv) {
         }
     }
 
+    // BF16 CHANGE: Ensure -d and -bf16 are not used together
+    if (useDoubles && useBf16) {
+        fprintf(stderr, "Error: Cannot use both -d (double) and -bf16 at the same time.\n");
+        exit(EINVAL);
+    }
+
     if (argc - thisParam < 2)
         printf("Run length not specified in the command line. ");
     else
@@ -1196,11 +1219,15 @@ int main(int argc, char **argv) {
     printf("Using compare file: %s\n", kernelFile);
     printf("Burning for %d seconds.\n", runLength);
 
+    // BF16 CHANGE: Determine which template instantiation to launch
     if (useDoubles)
-        launch<double>(runLength, useDoubles, useTensorCores, useBytes,
+        launch<double>(runLength, useDoubles, useTensorCores, useBf16, useBytes,
                        device_id, kernelFile, sigterm_timeout_threshold_secs);
+    else if (useBf16)
+        launch<__nv_bfloat16>(runLength, useDoubles, useTensorCores, useBf16, useBytes,
+                              device_id, kernelFile, sigterm_timeout_threshold_secs);
     else
-        launch<float>(runLength, useDoubles, useTensorCores, useBytes,
+        launch<float>(runLength, useDoubles, useTensorCores, useBf16, useBytes,
                       device_id, kernelFile, sigterm_timeout_threshold_secs);
 
     return 0;

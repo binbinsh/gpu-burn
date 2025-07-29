@@ -27,6 +27,8 @@
  * either expressed or implied, of the FreeBSD Project.
  */
 
+ #include <cuda_bf16.h>
+
 // Actually, there are no rounding errors due to results being accumulated in an arbitrary order..
 // Therefore EPSILON = 0.0f is OK
 #define EPSILON 0.001f
@@ -58,4 +60,23 @@ extern "C" __global__ void compareD(double *C, int *faultyElems, size_t iters) {
 			myFaulty++;
 
 	atomicAdd(faultyElems, myFaulty);
+}
+
+// Kernel for bfloat16 comparison
+extern "C" __global__ void compareBf16(const __nv_bfloat16 *data, int *faulty, size_t iters) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
+    unsigned int tid = idy * 8192 + idx;
+
+    const __nv_bfloat16 reference = data[0];
+
+    for (size_t i = 0; i < iters; ++i) {
+        __nv_bfloat16 val = data[i * 8192 * 8192 + tid];
+        
+        // MODIFICATION: Compare by casting to float instead of using __ne intrinsic.
+        // This is more compatible with different CUDA toolkit versions.
+        if ((float)val != (float)reference) {
+            atomicAdd(faulty, 1);
+        }
+    }
 }
